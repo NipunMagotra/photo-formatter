@@ -1,4 +1,4 @@
-import { ImageSpec } from "./presets";
+import { ImageSpec, DocumentPreset } from "./presets";
 
 export interface ProcessingResult {
     dataUrl: string;
@@ -9,6 +9,114 @@ export interface ProcessingResult {
     valid: boolean;
     validationErrors: string[];
 }
+
+/**
+ * Processes a DOCUMENT image client-side:
+ * - Scales to maxWidth maintaining full aspect ratio (no cropping)
+ * - White background for transparent PNGs
+ * - Compresses to target KB range via binary-search
+ */
+export async function processDocument(
+    file: File,
+    preset: DocumentPreset,
+    customMinKB?: number,
+    customMaxKB?: number,
+    onProgress?: (pct: number) => void
+): Promise<ProcessingResult> {
+    onProgress?.(10);
+
+    const minKB = customMinKB ?? preset.min_kb;
+    const maxKB = customMaxKB ?? preset.max_kb;
+
+    const imageBitmap = await createImageBitmap(file);
+    onProgress?.(30);
+
+    // Scale to maxWidth maintaining aspect ratio
+    const scale = Math.min(
+        preset.maxWidth / imageBitmap.width,
+        1 // never upscale beyond original
+    );
+    const W = Math.round(imageBitmap.width * scale);
+    const H = Math.round(imageBitmap.height * scale);
+
+    const canvas = document.createElement("canvas");
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext("2d")!;
+
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, W, H);
+    ctx.drawImage(imageBitmap, 0, 0, W, H);
+    onProgress?.(55);
+
+    const targetMinBytes = minKB * 1024;
+    const targetMaxBytes = maxKB * 1024;
+
+    // Binary-search quality
+    let lo = 0.05;
+    let hi = 1.0;
+    let bestDataUrl = canvas.toDataURL("image/jpeg", 1.0);
+    let bestBytes = base64ByteLength(bestDataUrl);
+
+    for (let i = 0; i < 18; i++) {
+        const mid = (lo + hi) / 2;
+        const candidate = canvas.toDataURL("image/jpeg", mid);
+        const bytes = base64ByteLength(candidate);
+
+        if (bytes >= targetMinBytes && bytes <= targetMaxBytes) {
+            bestDataUrl = candidate;
+            bestBytes = bytes;
+            break;
+        } else if (bytes > targetMaxBytes) {
+            hi = mid;
+            if (bytes < bestBytes || bestBytes > targetMaxBytes) {
+                bestDataUrl = candidate;
+                bestBytes = bytes;
+            }
+        } else {
+            lo = mid;
+            if (bytes > bestBytes || bestBytes > targetMaxBytes) {
+                bestDataUrl = candidate;
+                bestBytes = bytes;
+            }
+        }
+    }
+
+    onProgress?.(78);
+
+    // Pad up if still below min
+    bestBytes = base64ByteLength(bestDataUrl);
+    if (bestBytes < targetMinBytes) {
+        bestDataUrl = await padToMinSize(canvas, ctx, targetMinBytes, targetMaxBytes);
+        bestBytes = base64ByteLength(bestDataUrl);
+    }
+
+    onProgress?.(92);
+
+    const finalKB = bestBytes / 1024;
+    const validationErrors: string[] = [];
+    if (finalKB < minKB)
+        validationErrors.push(
+            `File size ${finalKB.toFixed(1)} KB is below minimum ${minKB} KB`
+        );
+    if (finalKB > maxKB)
+        validationErrors.push(
+            `File size ${finalKB.toFixed(1)} KB exceeds maximum ${maxKB} KB`
+        );
+
+    onProgress?.(100);
+
+    return {
+        dataUrl: bestDataUrl,
+        width: W,
+        height: H,
+        sizeKB: parseFloat(finalKB.toFixed(1)),
+        format: "JPG",
+        valid: validationErrors.length === 0,
+        validationErrors,
+    };
+}
+
 
 /**
  * Processes an image client-side using Canvas API:

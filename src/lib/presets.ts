@@ -198,3 +198,111 @@ export const PORTAL_PRESETS: Record<string, PortalPreset> = {
 };
 
 export const PRESET_LIST = Object.values(PORTAL_PRESETS);
+
+// ─────────────────────────────────────────────
+// Document Presets
+// ─────────────────────────────────────────────
+
+export interface DocumentPreset {
+  id: string;
+  label: string;
+  icon: string;
+  description: string;
+  /** Max width to render at — height auto-scales maintaining aspect ratio */
+  maxWidth: number;
+  min_kb: number;
+  max_kb: number;
+  format: "jpg";
+  notes: string;
+  examples: string;
+}
+
+export const DOCUMENT_PRESETS: Record<string, DocumentPreset> = {
+  aadhaar: {
+    id: "aadhaar",
+    label: "Aadhaar / Voter ID",
+    icon: "🪪",
+    description: "Identity proof — both sides as single image",
+    maxWidth: 1000,
+    min_kb: 50,
+    max_kb: 300,
+    format: "jpg",
+    notes: "Scan both sides clearly, keep text legible",
+    examples: "Aadhaar Card, Voter ID, PAN Card, Driving Licence",
+  },
+  marksheet: {
+    id: "marksheet",
+    label: "Marksheet / Admit Card",
+    icon: "📄",
+    description: "Academic marksheet or exam admit card scan",
+    maxWidth: 1240,
+    min_kb: 100,
+    max_kb: 500,
+    format: "jpg",
+    notes: "Scan full page, ensure all marks/grades are readable",
+    examples: "10th/12th Marksheet, Degree Certificate, Admit Card",
+  },
+  certificate: {
+    id: "certificate",
+    label: "Certificate / Degree",
+    icon: "🎓",
+    description: "Academic or professional certificate",
+    maxWidth: 1240,
+    min_kb: 100,
+    max_kb: 500,
+    format: "jpg",
+    notes: "Full page scan, institution seal must be visible",
+    examples: "Degree, Diploma, Course Completion Certificate",
+  },
+  caste: {
+    id: "caste",
+    label: "Caste / Category Certificate",
+    icon: "📋",
+    description: "SC/ST/OBC/EWS category certificate",
+    maxWidth: 1240,
+    min_kb: 50,
+    max_kb: 300,
+    format: "jpg",
+    notes: "Government-issued certificate with official seal",
+    examples: "SC/ST Certificate, OBC Certificate, EWS Certificate",
+  },
+  address: {
+    id: "address",
+    label: "Address Proof",
+    icon: "🏠",
+    description: "Domicile or residence proof document",
+    maxWidth: 1000,
+    min_kb: 50,
+    max_kb: 300,
+    format: "jpg",
+    notes: "Name and address must be clearly legible",
+    examples: "Utility Bill, Bank Passbook, Rent Agreement",
+  },
+  experience: {
+    id: "experience",
+    label: "Experience / NOC Letter",
+    icon: "📝",
+    description: "Work experience or No Objection Certificate",
+    maxWidth: 1240,
+    min_kb: 50,
+    max_kb: 400,
+    format: "jpg",
+    notes: "Official letterhead, signature and stamp required",
+    examples: "Experience Certificate, NOC, Service Certificate",
+  },
+  custom_doc: {
+    id: "custom_doc",
+    label: "Custom Document",
+    icon: "⚙️",
+    description: "Set your own file size limits",
+    maxWidth: 1240,
+    min_kb: 50,
+    max_kb: 500,
+    format: "jpg",
+    notes: "Configure manually for any document type",
+    examples: "Any scanned document",
+  },
+};
+
+export const DOCUMENT_PRESET_LIST = Object.values(DOCUMENT_PRESETS);
+
