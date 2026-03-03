@@ -1,523 +1,572 @@
 "use client";
 
 import { useState, useCallback } from "react";
-import DropZone from "@/components/DropZone";
-import PresetSelector from "@/components/PresetSelector";
-import SpecPanel from "@/components/SpecPanel";
-import ResultCard from "@/components/ResultCard";
-import SessionHistory, { HistoryEntry } from "@/components/SessionHistory";
-import ToastContainer, { showToast } from "@/components/Toast";
-import DocumentFormatter from "@/components/DocumentFormatter";
-import { PORTAL_PRESETS } from "@/lib/presets";
-import { processImage, ProcessingResult } from "@/lib/imageProcessor";
+import { useDropzone } from "react-dropzone";
+import { PORTAL_PRESETS, DOCUMENT_PRESETS, DOCUMENT_PRESET_LIST } from "@/lib/presets";
+import { processImage, processDocument, downloadDataUrl, ProcessingResult } from "@/lib/imageProcessor";
 import { ImageSpec } from "@/lib/presets";
 
-type Step = "upload" | "preset" | "results";
-type MainTab = "photo-sig" | "documents";
+/* ── tiny toast ── */
+let toastId = 0;
+type Toast = { id: number; msg: string; ok: boolean };
 
-interface Results {
-  photo?: ProcessingResult;
-  signature?: ProcessingResult;
+function useToasts() {
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const add = (msg: string, ok = true) => {
+    const id = ++toastId;
+    setToasts(p => [...p, { id, msg, ok }]);
+    setTimeout(() => setToasts(p => p.filter(t => t.id !== id)), 3500);
+  };
+  return { toasts, add };
 }
 
-let historyCounter = 0;
+/* ── simple dropzone ── */
+function DZ({ label, badge, onFile, file, preview, onRemove }: {
+  label: string; badge: string;
+  onFile: (f: File) => void; file: File | null;
+  preview: string | null; onRemove: () => void;
+}) {
+  const [drag, setDrag] = useState(false);
+  const { getRootProps, getInputProps, open } = useDropzone({
+    accept: { "image/*": [".jpg", ".jpeg", ".png", ".webp"] },
+    maxSize: 5 * 1024 * 1024,
+    multiple: false,
+    noClick: !!file,
+    onDrop: (a) => { if (a[0]) onFile(a[0]); },
+    onDragEnter: () => setDrag(true),
+    onDragLeave: () => setDrag(false),
+    onDropAccepted: () => setDrag(false),
+    onDropRejected: () => setDrag(false),
+  });
 
-export default function HomePage() {
-  // Main tab
-  const [mainTab, setMainTab] = useState<MainTab>("photo-sig");
+  return (
+    <div
+      {...getRootProps()}
+      className={`dz${drag ? " drag" : ""}${file ? " filled" : ""}`}
+      role="button"
+      aria-label={`Upload ${label}`}
+      tabIndex={0}
+    >
+      <input {...getInputProps()} id={`input-${badge}`} />
+      {file && (
+        <button className="dz-remove" type="button" onClick={e => { e.stopPropagation(); onRemove(); }} aria-label="Remove">✕</button>
+      )}
+      {preview
+        ? <>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={preview} alt={label} className="dz-preview" />
+          <span className="dz-badge" style={{ color: "var(--success)" }}>✓ {badge}</span>
+          <span className="dz-hint">{file?.name}</span>
+        </>
+        : <>
+          <span className="dz-icon">{badge === "PHOTO" ? "📷" : "✒️"}</span>
+          <span className="dz-label">{label}</span>
+          <span className="dz-hint">
+            Drop here or{" "}
+            <span className="dz-link" onClick={e => { e.stopPropagation(); open(); }}>browse</span>
+          </span>
+          <span className="dz-hint" style={{ fontSize: "11px" }}>JPG · PNG · max 5 MB</span>
+        </>
+      }
+    </div>
+  );
+}
 
-  // Files
+/* ── result box ── */
+function ResultBox({ label, result, filename }: {
+  label: string; result: ProcessingResult; filename: string;
+}) {
+  const ok = result.valid;
+  return (
+    <div className={`result-box ${ok ? "ok" : "warn"}`}>
+      <div className="result-img-wrap">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={result.dataUrl} alt={label} className="result-img" />
+      </div>
+      <div className="result-body">
+        <div className="result-name">{label}</div>
+        <div className="result-meta">
+          {result.width}×{result.height}px · {result.sizeKB} KB · JPG
+        </div>
+        <div className={`result-status ${ok ? "ok" : "warn"}`}>
+          {ok ? "✅ Ready to upload" : "⚠ Check size"}
+        </div>
+        <button className="dl-btn" onClick={() => downloadDataUrl(result.dataUrl, filename)}>
+          ↓ Download
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════
+   MAIN PAGE
+═══════════════════════════════════════════ */
+export default function Page() {
+  const { toasts, add } = useToasts();
+
+  /* tab */
+  const [tab, setTab] = useState<"ps" | "doc">("ps");
+
+  /* photo & sig */
   const [photoFile, setPhotoFile] = useState<File | null>(null);
   const [sigFile, setSigFile] = useState<File | null>(null);
   const [photoPreview, setPhotoPreview] = useState<string | null>(null);
   const [sigPreview, setSigPreview] = useState<string | null>(null);
 
-  // Preset
-  const [selectedPreset, setSelectedPreset] = useState("ssc");
+  /* portal preset */
+  const [portalId, setPortalId] = useState("ssc");
+  const preset = PORTAL_PRESETS[portalId];
+  const isCustom = portalId === "custom";
+  const [customPhotoMin, setCustomPhotoMin] = useState(20);
+  const [customPhotoMax, setCustomPhotoMax] = useState(50);
+  const [customSigMin, setCustomSigMin] = useState(10);
+  const [customSigMax, setCustomSigMax] = useState(20);
+  const [customPhotoW, setCustomPhotoW] = useState(200);
+  const [customPhotoH, setCustomPhotoH] = useState(230);
+  const [customSigW, setCustomSigW] = useState(140);
+  const [customSigH, setCustomSigH] = useState(60);
 
-  // Custom overrides
-  const [customPhoto, setCustomPhoto] = useState<Partial<ImageSpec>>({});
-  const [customSig, setCustomSig] = useState<Partial<ImageSpec>>({});
+  const effectivePhoto: ImageSpec = isCustom
+    ? { ...preset.photo, width: customPhotoW, height: customPhotoH, min_kb: customPhotoMin, max_kb: customPhotoMax }
+    : preset.photo;
+  const effectiveSig: ImageSpec = isCustom
+    ? { ...preset.signature, width: customSigW, height: customSigH, min_kb: customSigMin, max_kb: customSigMax }
+    : preset.signature;
 
-  // Processing
-  const [processing, setProcessing] = useState(false);
+  /* results */
+  const [photoResult, setPhotoResult] = useState<ProcessingResult | null>(null);
+  const [sigResult, setSigResult] = useState<ProcessingResult | null>(null);
+  const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
+  const [done, setDone] = useState(false);
 
-  // Results
-  const [results, setResults] = useState<Results>({});
-  const [step, setStep] = useState<Step>("upload");
+  /* doc mode */
+  const [docPresetId, setDocPresetId] = useState("marksheet");
+  const [docMin, setDocMin] = useState(100);
+  const [docMax, setDocMax] = useState(500);
+  const [docFiles, setDocFiles] = useState<{ id: number; file: File; preview: string; result?: ProcessingResult }[]>([]);
+  let docCounter = 0;
+  const [docDrag, setDocDrag] = useState(false);
 
-  // History
-  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const docPreset = DOCUMENT_PRESETS[docPresetId];
+  const isDocCustom = docPresetId === "custom_doc";
+  const effectiveDocMin = isDocCustom ? docMin : docPreset.min_kb;
+  const effectiveDocMax = isDocCustom ? docMax : docPreset.max_kb;
 
-  const preset = PORTAL_PRESETS[selectedPreset];
-  const isCustom = selectedPreset === "custom";
+  const { getRootProps: getDocRootProps, getInputProps: getDocInputProps, open: openDoc } = useDropzone({
+    accept: { "image/*": [".jpg", ".jpeg", ".png", ".webp"] },
+    maxSize: 10 * 1024 * 1024,
+    multiple: true,
+    onDrop: (accepted) => {
+      const newEntries = accepted.map(f => ({
+        id: ++docCounter,
+        file: f,
+        preview: URL.createObjectURL(f),
+      }));
+      setDocFiles(prev => [...prev, ...newEntries].slice(0, 8));
+    },
+    onDragEnter: () => setDocDrag(true),
+    onDragLeave: () => setDocDrag(false),
+    onDropAccepted: () => setDocDrag(false),
+    onDropRejected: () => setDocDrag(false),
+  });
 
-  const effectivePhoto: ImageSpec = {
-    ...preset.photo,
-    ...(isCustom ? customPhoto : {}),
-  };
-  const effectiveSig: ImageSpec = {
-    ...preset.signature,
-    ...(isCustom ? customSig : {}),
-  };
-
+  /* handlers */
   const handlePhotoFile = useCallback((f: File) => {
-    setPhotoFile(f);
-    setPhotoPreview(URL.createObjectURL(f));
+    setPhotoFile(f); setPhotoPreview(URL.createObjectURL(f));
+    setPhotoResult(null); setDone(false);
   }, []);
-
   const handleSigFile = useCallback((f: File) => {
-    setSigFile(f);
-    setSigPreview(URL.createObjectURL(f));
+    setSigFile(f); setSigPreview(URL.createObjectURL(f));
+    setSigResult(null); setDone(false);
   }, []);
+  const resetPhoto = () => { setPhotoFile(null); setPhotoPreview(null); setPhotoResult(null); setDone(false); };
+  const resetSig = () => { setSigFile(null); setSigPreview(null); setSigResult(null); setDone(false); };
 
-  const removePhoto = () => {
-    setPhotoFile(null);
-    setPhotoPreview(null);
-  };
-
-  const removeSig = () => {
-    setSigFile(null);
-    setSigPreview(null);
-  };
-
-  const canGenerate = (photoFile || sigFile) && !processing;
-
-  const handleGenerate = async () => {
-    if (!canGenerate) return;
-    setProcessing(true);
-    setProgress(0);
-    setResults({});
-
+  const handleFormat = async () => {
+    if ((!photoFile && !sigFile) || busy) return;
+    setBusy(true); setProgress(0); setPhotoResult(null); setSigResult(null); setDone(false);
     try {
-      const newResults: Results = {};
-      const newHistory: HistoryEntry[] = [];
-
       if (photoFile) {
-        setProgressLabel("Processing photo…");
-        const r = await processImage(photoFile, effectivePhoto, (pct) =>
-          setProgress(Math.round(pct * 0.5))
-        );
-        newResults.photo = r;
-        newHistory.push({
-          id: ++historyCounter,
-          label: `${preset.id.toUpperCase()} Photo`,
-          type: "photo",
-          presetId: preset.id,
-          result: r,
-          timestamp: new Date(),
-        });
-        if (r.valid) showToast("Photo formatted successfully!", "success");
-        else showToast("Photo processed but check validation.", "warning");
+        setProgressLabel("Formatting photo…");
+        const r = await processImage(photoFile, effectivePhoto, p => setProgress(Math.round(p * (sigFile ? 0.5 : 1))));
+        setPhotoResult(r);
+        add(r.valid ? "Photo ready ✓" : "Photo processed — check size", r.valid);
       }
-
       if (sigFile) {
-        setProgressLabel("Processing signature…");
-        const r = await processImage(sigFile, effectiveSig, (pct) =>
-          setProgress(50 + Math.round(pct * 0.5))
-        );
-        newResults.signature = r;
-        newHistory.push({
-          id: ++historyCounter,
-          label: `${preset.id.toUpperCase()} Signature`,
-          type: "signature",
-          presetId: preset.id,
-          result: r,
-          timestamp: new Date(),
-        });
-        if (r.valid) showToast("Signature formatted successfully!", "success");
-        else showToast("Signature processed but check validation.", "warning");
+        setProgressLabel("Formatting signature…");
+        const start = photoFile ? 50 : 0;
+        const r = await processImage(sigFile, effectiveSig, p => setProgress(start + Math.round(p * (photoFile ? 0.5 : 1))));
+        setSigResult(r);
+        add(r.valid ? "Signature ready ✓" : "Signature processed — check size", r.valid);
       }
-
-      setResults(newResults);
-      setHistory((prev) => [...prev, ...newHistory].slice(-5));
-      setStep("results");
-    } catch (err) {
-      console.error(err);
-      showToast("Processing failed. Please try again.", "error");
+      setDone(true);
+    } catch {
+      add("Something went wrong. Try again.", false);
     } finally {
-      setProcessing(false);
-      setProgress(100);
+      setBusy(false); setProgress(100);
     }
   };
 
-  const handleReset = () => {
-    setPhotoFile(null);
-    setSigFile(null);
-    setPhotoPreview(null);
-    setSigPreview(null);
-    setResults({});
-    setStep("upload");
-    setProgress(0);
+  const handleDocFormat = async () => {
+    if (!docFiles.length || busy) return;
+    setBusy(true); setProgress(0);
+    const updated = [...docFiles];
+    for (let i = 0; i < updated.length; i++) {
+      setProgressLabel(`Formatting document ${i + 1} of ${updated.length}…`);
+      try {
+        const r = await processDocument(
+          updated[i].file, docPreset,
+          effectiveDocMin, effectiveDocMax,
+          p => setProgress(Math.round(((i + p / 100) / updated.length) * 100))
+        );
+        updated[i] = { ...updated[i], result: r };
+        add(`${updated[i].file.name} done`, r.valid);
+      } catch {
+        add(`Failed: ${updated[i].file.name}`, false);
+      }
+    }
+    setDocFiles(updated);
+    setBusy(false); setProgress(100);
   };
 
-  const currentStep = step === "results" ? 3 : photoFile || sigFile ? 2 : 1;
+  const canFormat = (photoFile || sigFile) && !busy;
+  const canDocFormat = docFiles.length > 0 && !busy;
 
   return (
     <>
-      {/* ── HEADER ── */}
-      <header className="site-header" role="banner">
-        <div className="header-logo">
-          <div className="header-logo__icon" aria-hidden="true">📋</div>
-          <div>
-            <div className="header-logo__name">
-              Form<span>Ready</span>
-            </div>
-            <div className="header-tagline">Govt Portal Photo &amp; Document Formatter</div>
-          </div>
-        </div>
-        <span className="header-badge">Free MVP</span>
+      {/* ── TOP BAR ── */}
+      <header className="top-bar">
+        <span className="logo">Form<span>Ready</span></span>
+        <a href="/admin" className="admin-link">Admin ↗</a>
       </header>
 
-      {/* ── HERO ── */}
-      <section className="hero" aria-labelledby="hero-title">
-        <div className="hero-content">
-          <div className="hero-eyebrow">
-            <span aria-hidden="true">⚡</span> Instant formatting · No sign-up required
-          </div>
-          <h1 className="hero-title" id="hero-title">
-            Format Photos, Signatures &amp;{" "}
-            <span className="accent">Documents</span> for Any Govt Portal
-          </h1>
-          <p className="hero-subtitle">
-            SSC · IBPS · RRB · UPSC · State PSC · NTA<br />
-            Auto-resize, compress &amp; validate photos, signatures, and scanned
-            documents in seconds — not minutes.
-          </p>
-          <div className="hero-stats" role="list">
-            <div className="hero-stat" role="listitem">
-              <span className="hero-stat__number">&lt;5s</span>
-              <span className="hero-stat__label">Processing time</span>
-            </div>
-            <div className="hero-stat" role="listitem">
-              <span className="hero-stat__number">6+</span>
-              <span className="hero-stat__label">Portal presets</span>
-            </div>
-            <div className="hero-stat" role="listitem">
-              <span className="hero-stat__number">7</span>
-              <span className="hero-stat__label">Doc types</span>
-            </div>
-            <div className="hero-stat" role="listitem">
-              <span className="hero-stat__number">0</span>
-              <span className="hero-stat__label">Files stored</span>
-            </div>
-          </div>
-        </div>
-      </section>
+      <div className="page-wrap">
 
-      {/* ── MAIN ── */}
-      <main className="main-wrapper" id="main-content">
-
-        {/* ══ MAIN TABS ══ */}
-        <div className="main-tabs" role="tablist" aria-label="Formatter mode" style={{ marginBottom: "var(--space-8)" }}>
+        {/* ── TABS ── */}
+        <div className="tab-row" role="tablist">
           <button
-            id="tab-photo-sig"
-            className={`main-tab${mainTab === "photo-sig" ? " active" : ""}`}
-            role="tab"
-            aria-selected={mainTab === "photo-sig"}
-            aria-controls="panel-photo-sig"
-            onClick={() => setMainTab("photo-sig")}
+            id="tab-ps"
+            className={`tab-btn${tab === "ps" ? " active" : ""}`}
+            role="tab" aria-selected={tab === "ps"}
+            onClick={() => setTab("ps")}
           >
-            <span aria-hidden="true">📷</span> Photo &amp; Signature
+            📷 Photo & Signature
           </button>
           <button
-            id="tab-documents"
-            className={`main-tab${mainTab === "documents" ? " active" : ""}`}
-            role="tab"
-            aria-selected={mainTab === "documents"}
-            aria-controls="panel-documents"
-            onClick={() => setMainTab("documents")}
+            id="tab-doc"
+            className={`tab-btn${tab === "doc" ? " active" : ""}`}
+            role="tab" aria-selected={tab === "doc"}
+            onClick={() => setTab("doc")}
           >
-            <span aria-hidden="true">📄</span> Documents
+            📄 Documents
           </button>
         </div>
 
-        {/* ══ PHOTO & SIGNATURE PANEL ══ */}
-        <div
-          id="panel-photo-sig"
-          role="tabpanel"
-          aria-labelledby="tab-photo-sig"
-          hidden={mainTab !== "photo-sig"}
-        >
-          {/* Step progress bar */}
-          <nav className="steps-bar" aria-label="Progress steps">
-            {[
-              { num: 1, label: "Upload" },
-              { num: 2, label: "Select Portal" },
-              { num: 3, label: "Download" },
-            ].map((s, i) => (
-              <div
-                key={s.num}
-                className={`step-item${currentStep > s.num ? " done" : ""}${currentStep === s.num ? " active" : ""
-                  }`}
-                style={{ width: i < 2 ? "200px" : "auto" }}
-              >
-                <div className="step-num">
-                  {currentStep > s.num ? "✓" : s.num}
+        {/* ══════ PHOTO & SIGNATURE ══════ */}
+        <div hidden={tab !== "ps"} role="tabpanel" aria-labelledby="tab-ps">
+
+          {/* Step 1 — Upload */}
+          <div className="step">
+            <div className="step-label">
+              <div className={`step-num${photoFile || sigFile ? " done" : ""}`}>
+                {(photoFile || sigFile) ? "✓" : "1"}
+              </div>
+              <span className="step-title">Upload your files</span>
+            </div>
+            <div className="upload-row">
+              <DZ
+                label="Passport Photo" badge="PHOTO"
+                file={photoFile} preview={photoPreview}
+                onFile={handlePhotoFile} onRemove={resetPhoto}
+              />
+              <DZ
+                label="Signature" badge="SIGNATURE"
+                file={sigFile} preview={sigPreview}
+                onFile={handleSigFile} onRemove={resetSig}
+              />
+            </div>
+          </div>
+
+          {/* Step 2 — Portal */}
+          <div className="step">
+            <div className="step-label">
+              <div className="step-num" style={{ background: "var(--navy)" }}>2</div>
+              <span className="step-title">Select exam portal</span>
+            </div>
+
+            <select
+              id="portal-select"
+              className="portal-select"
+              value={portalId}
+              onChange={e => setPortalId(e.target.value)}
+              aria-label="Select exam portal"
+            >
+              {Object.values(PORTAL_PRESETS).map(p => (
+                <option key={p.id} value={p.id}>{p.icon} {p.label}</option>
+              ))}
+            </select>
+
+            {!isCustom ? (
+              <div className="spec-bar">
+                <span className="spec-pill">📷 Photo: <strong>{preset.photo.width}×{preset.photo.height}px</strong></span>
+                <span className="spec-pill"><strong>{preset.photo.min_kb}–{preset.photo.max_kb} KB</strong></span>
+                <span className="spec-pill">✒️ Sig: <strong>{preset.signature.width}×{preset.signature.height}px</strong></span>
+                <span className="spec-pill"><strong>{preset.signature.min_kb}–{preset.signature.max_kb} KB</strong></span>
+              </div>
+            ) : (
+              <div>
+                <p style={{ fontSize: "12px", fontWeight: 700, color: "var(--muted)", marginTop: "14px", marginBottom: "8px" }}>PHOTO SETTINGS</p>
+                <div className="custom-row">
+                  <div>
+                    <label className="field-label">Width (px)</label>
+                    <input className="field-input" type="number" value={customPhotoW} min={10} onChange={e => setCustomPhotoW(+e.target.value)} />
+                  </div>
+                  <div>
+                    <label className="field-label">Height (px)</label>
+                    <input className="field-input" type="number" value={customPhotoH} min={10} onChange={e => setCustomPhotoH(+e.target.value)} />
+                  </div>
+                  <div>
+                    <label className="field-label">Min KB</label>
+                    <input className="field-input" type="number" value={customPhotoMin} min={1} onChange={e => setCustomPhotoMin(+e.target.value)} />
+                  </div>
+                  <div>
+                    <label className="field-label">Max KB</label>
+                    <input className="field-input" type="number" value={customPhotoMax} min={1} onChange={e => setCustomPhotoMax(+e.target.value)} />
+                  </div>
                 </div>
-                <div className="step-label">{s.label}</div>
+                <p style={{ fontSize: "12px", fontWeight: 700, color: "var(--muted)", marginTop: "14px", marginBottom: "8px" }}>SIGNATURE SETTINGS</p>
+                <div className="custom-row">
+                  <div>
+                    <label className="field-label">Width (px)</label>
+                    <input className="field-input" type="number" value={customSigW} min={10} onChange={e => setCustomSigW(+e.target.value)} />
+                  </div>
+                  <div>
+                    <label className="field-label">Height (px)</label>
+                    <input className="field-input" type="number" value={customSigH} min={10} onChange={e => setCustomSigH(+e.target.value)} />
+                  </div>
+                  <div>
+                    <label className="field-label">Min KB</label>
+                    <input className="field-input" type="number" value={customSigMin} min={1} onChange={e => setCustomSigMin(+e.target.value)} />
+                  </div>
+                  <div>
+                    <label className="field-label">Max KB</label>
+                    <input className="field-input" type="number" value={customSigMax} min={1} onChange={e => setCustomSigMax(+e.target.value)} />
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Step 3 — Format & Download */}
+          <div className="step">
+            <div className="step-label">
+              <div className={`step-num${done ? " done" : ""}`}>{done ? "✓" : "3"}</div>
+              <span className="step-title">Format &amp; download</span>
+            </div>
+
+            <button
+              id="format-btn"
+              className="cta-btn"
+              onClick={handleFormat}
+              disabled={!canFormat}
+              aria-label="Format images"
+            >
+              {busy ? "Formatting…" : "⚡ Format Now"}
+            </button>
+
+            {(photoResult || sigResult) && (
+              <>
+                <div className="result-row">
+                  {photoResult && (
+                    <ResultBox
+                      label="Photo"
+                      result={photoResult}
+                      filename={`${portalId.toUpperCase()}_Photo_${photoResult.width}x${photoResult.height}.jpg`}
+                    />
+                  )}
+                  {sigResult && (
+                    <ResultBox
+                      label="Signature"
+                      result={sigResult}
+                      filename={`${portalId.toUpperCase()}_Signature_${sigResult.width}x${sigResult.height}.jpg`}
+                    />
+                  )}
+                </div>
+                <span className="reset-link" onClick={() => { resetPhoto(); resetSig(); setDone(false); }}>
+                  Start over
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* ══════ DOCUMENTS ══════ */}
+        <div hidden={tab !== "doc"} role="tabpanel" aria-labelledby="tab-doc">
+
+          {/* Step 1 — Document type */}
+          <div className="step">
+            <div className="step-label">
+              <div className="step-num">1</div>
+              <span className="step-title">Select document type</span>
+            </div>
+            <select
+              id="doc-type-select"
+              className="portal-select"
+              value={docPresetId}
+              onChange={e => setDocPresetId(e.target.value)}
+              aria-label="Select document type"
+            >
+              {DOCUMENT_PRESET_LIST.map(p => (
+                <option key={p.id} value={p.id}>{p.icon} {p.label}</option>
+              ))}
+            </select>
+
+            {!isDocCustom ? (
+              <div className="spec-bar">
+                <span className="spec-pill">Target: <strong>{docPreset.min_kb}–{docPreset.max_kb} KB</strong></span>
+                <span className="spec-pill">Max width: <strong>{docPreset.maxWidth}px</strong></span>
+                <span className="spec-pill" style={{ color: "var(--muted)" }}>{docPreset.notes}</span>
+              </div>
+            ) : (
+              <div className="custom-row" style={{ marginTop: "12px" }}>
+                <div>
+                  <label className="field-label">Min KB</label>
+                  <input className="field-input" type="number" value={docMin} min={1} onChange={e => setDocMin(+e.target.value)} />
+                </div>
+                <div>
+                  <label className="field-label">Max KB</label>
+                  <input className="field-input" type="number" value={docMax} min={1} onChange={e => setDocMax(+e.target.value)} />
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Step 2 — Upload documents */}
+          <div className="step">
+            <div className="step-label">
+              <div className={`step-num${docFiles.length ? " done" : ""}`}>{docFiles.length ? "✓" : "2"}</div>
+              <span className="step-title">Upload documents <span style={{ fontWeight: 400, color: "var(--muted)" }}>({docFiles.length}/8)</span></span>
+            </div>
+
+            <div
+              {...getDocRootProps()}
+              className={`dz${docDrag ? " drag" : ""}`}
+              style={{ minHeight: "90px", marginBottom: "12px" }}
+              role="button"
+              aria-label="Upload document images"
+              tabIndex={0}
+            >
+              <input {...getDocInputProps()} id="doc-input" />
+              <span className="dz-icon">📄</span>
+              <span className="dz-hint">
+                Drop images here or{" "}
+                <span className="dz-link" onClick={e => { e.stopPropagation(); openDoc(); }}>browse</span>
+              </span>
+              <span className="dz-hint" style={{ fontSize: "11px" }}>JPG · PNG · WEBP · up to 8 files · max 10 MB each</span>
+            </div>
+
+            {docFiles.map(d => (
+              <div key={d.id} className="doc-file-row">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={d.preview} alt={d.file.name} className="doc-thumb" />
+                <div className="doc-info">
+                  <div className="doc-name">{d.file.name}</div>
+                  <div className="doc-sub">
+                    {(d.file.size / 1024).toFixed(1)} KB original
+                    {d.result && (
+                      <span style={{ marginLeft: "6px", color: d.result.valid ? "var(--success)" : "var(--warn)", fontWeight: 600 }}>
+                        → {d.result.sizeKB} KB {d.result.valid ? "✓" : "⚠"}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="doc-actions">
+                  {d.result && (
+                    <button
+                      className="sm-btn navy"
+                      onClick={() => downloadDataUrl(d.result!.dataUrl, `${docPresetId}_${d.file.name.replace(/\.[^.]+$/, "")}.jpg`)}
+                      aria-label="Download"
+                    >↓</button>
+                  )}
+                  <button
+                    className="sm-btn red"
+                    onClick={() => setDocFiles(p => p.filter(x => x.id !== d.id))}
+                    aria-label="Remove"
+                  >✕</button>
+                </div>
               </div>
             ))}
-          </nav>
+          </div>
 
-          {/* STEP 1: UPLOAD */}
-          <section className="card" aria-labelledby="upload-heading">
-            <div className="card-header">
-              <div className="card-header__icon" aria-hidden="true">📤</div>
-              <div>
-                <h2 className="card-header__title" id="upload-heading">
-                  Upload Your Files
-                </h2>
-                <p className="card-header__subtitle">
-                  Upload a photo, signature, or both — JPG, PNG, WEBP accepted
-                </p>
-              </div>
+          {/* Step 3 — Format */}
+          <div className="step">
+            <div className="step-label">
+              <div className="step-num">3</div>
+              <span className="step-title">Format &amp; download</span>
             </div>
-            <div className="upload-grid">
-              <DropZone
-                label="Passport Photo"
-                icon="🧑‍💼"
-                typeBadge="PHOTO"
-                file={photoFile}
-                preview={photoPreview}
-                onFile={handlePhotoFile}
-                onRemove={removePhoto}
-              />
-              <DropZone
-                label="Signature"
-                icon="✒️"
-                typeBadge="SIGNATURE"
-                file={sigFile}
-                preview={sigPreview}
-                onFile={handleSigFile}
-                onRemove={removeSig}
-              />
-            </div>
-          </section>
 
-          {/* STEP 2: PRESET */}
-          <section className="card" aria-labelledby="preset-heading">
-            <div className="card-header">
-              <div className="card-header__icon" aria-hidden="true">🏛️</div>
-              <div>
-                <h2 className="card-header__title" id="preset-heading">
-                  Select Exam Portal
-                </h2>
-                <p className="card-header__subtitle">
-                  Choose a preset to auto-load validated specifications
-                </p>
-              </div>
-            </div>
-            <PresetSelector
-              selected={selectedPreset}
-              onSelect={(id) => {
-                setSelectedPreset(id);
-                setCustomPhoto({});
-                setCustomSig({});
-              }}
-            />
-            <SpecPanel
-              preset={preset}
-              isCustom={isCustom}
-              customPhoto={customPhoto}
-              customSig={customSig}
-              onCustomPhotoChange={(field, val) =>
-                setCustomPhoto((prev) => ({ ...prev, [field]: val }))
-              }
-              onCustomSigChange={(field, val) =>
-                setCustomSig((prev) => ({ ...prev, [field]: val }))
-              }
-            />
-          </section>
-
-          {/* GENERATE BUTTON */}
-          {step !== "results" && (
             <button
-              id="generate-btn"
-              className="generate-btn"
-              onClick={handleGenerate}
-              disabled={!canGenerate}
-              aria-label="Auto format images"
+              id="format-docs-btn"
+              className="cta-btn"
+              onClick={handleDocFormat}
+              disabled={!canDocFormat}
+              aria-label="Format documents"
             >
-              <span className="btn-icon" aria-hidden="true">⚡</span>
-              {processing ? "Processing…" : "Auto Format Now"}
+              {busy ? "Formatting…" : `⚡ Format ${docFiles.length || ""} Document${docFiles.length !== 1 ? "s" : ""}`}
             </button>
-          )}
 
-          {/* STEP 3: RESULTS */}
-          {step === "results" && Object.keys(results).length > 0 && (
-            <section className="card" aria-labelledby="results-heading">
-              <div className="results-header">
-                <div className="card-header__icon" aria-hidden="true">✅</div>
-                <div>
-                  <h2
-                    className="card-header__title"
-                    id="results-heading"
-                    style={{ color: "var(--success-600)" }}
-                  >
-                    Your Files Are Ready
-                  </h2>
-                  <p className="card-header__subtitle">
-                    Processed for <strong>{preset.label}</strong> — download individually below
-                  </p>
-                </div>
-              </div>
-
-              <div className="results-grid">
-                {results.photo && (
-                  <ResultCard type="photo" result={results.photo} presetId={preset.id} />
-                )}
-                {results.signature && (
-                  <ResultCard type="signature" result={results.signature} presetId={preset.id} />
-                )}
-              </div>
-
-              <div style={{ display: "flex", gap: "var(--space-4)", flexWrap: "wrap" }}>
+            {docFiles.some(d => d.result) && (
+              <>
                 <button
-                  id="process-again-btn"
-                  className="generate-btn"
-                  onClick={handleGenerate}
-                  style={{ flex: 1, minWidth: "200px", marginTop: "var(--space-6)" }}
-                  aria-label="Process same files again with current settings"
+                  id="download-all-btn"
+                  className="dl-btn"
+                  style={{ width: "100%", marginBottom: "10px" }}
+                  onClick={() => docFiles.forEach(d => d.result && downloadDataUrl(
+                    d.result.dataUrl,
+                    `${docPresetId}_${d.file.name.replace(/\.[^.]+$/, "")}.jpg`
+                  ))}
+                  aria-label="Download all formatted documents"
                 >
-                  <span aria-hidden="true">🔄</span> Process Again
+                  ↓ Download All
                 </button>
-                <button
-                  id="start-over-btn"
-                  className="reset-btn"
-                  onClick={handleReset}
-                  aria-label="Start over with new files"
-                >
-                  ✕ Start Over
-                </button>
-              </div>
-            </section>
-          )}
-
-          {/* SESSION HISTORY */}
-          <section className="card" aria-labelledby="history-heading">
-            <div className="card-header">
-              <div className="card-header__icon" aria-hidden="true">🕐</div>
-              <div>
-                <h2 className="card-header__title" id="history-heading">
-                  Session History
-                </h2>
-                <p className="card-header__subtitle">
-                  Last 5 processed files — cleared when you close the tab
-                </p>
-              </div>
-            </div>
-            <SessionHistory entries={history} />
-          </section>
+                <span className="reset-link" onClick={() => setDocFiles([])}>Clear all</span>
+              </>
+            )}
+          </div>
         </div>
 
-        {/* ══ DOCUMENTS PANEL ══ */}
-        <div
-          id="panel-documents"
-          role="tabpanel"
-          aria-labelledby="tab-documents"
-          hidden={mainTab !== "documents"}
-        >
-          <section className="card" aria-labelledby="doc-heading">
-            <div className="card-header" style={{ marginBottom: "var(--space-2)" }}>
-              <div className="card-header__icon" aria-hidden="true">📂</div>
-              <div>
-                <h2 className="card-header__title" id="doc-heading">
-                  Document Formatter
-                </h2>
-                <p className="card-header__subtitle">
-                  Compress &amp; format scanned documents to portal-accepted KB limits — up to 8 files at once
-                </p>
-              </div>
-            </div>
-
-            {/* Info callout */}
-            <div style={{
-              background: "var(--navy-50)",
-              border: "1px solid var(--navy-200)",
-              borderRadius: "var(--radius-md)",
-              padding: "var(--space-4) var(--space-5)",
-              marginBottom: "var(--space-6)",
-              display: "flex",
-              gap: "var(--space-3)",
-              alignItems: "flex-start",
-            }}>
-              <span style={{ fontSize: "20px", flexShrink: 0 }}>💡</span>
-              <div>
-                <p style={{ fontSize: "var(--font-size-sm)", fontWeight: 600, color: "var(--navy-800)", marginBottom: "var(--space-1)" }}>
-                  How document formatting works
-                </p>
-                <p style={{ fontSize: "var(--font-size-sm)", color: "var(--gray-600)", lineHeight: 1.6 }}>
-                  Upload a scanned image of your document (JPG/PNG/WEBP). The formatter will compress it to the required KB range while keeping text fully legible. Aspect ratio is preserved — no cropping. Supports batch processing of up to 8 documents.
-                </p>
-              </div>
-            </div>
-
-            <DocumentFormatter />
-          </section>
-        </div>
-
-      </main>
-
-      {/* ── HOW IT WORKS ── */}
-      <section className="how-section" aria-labelledby="how-heading">
-        <h2 className="how-title" id="how-heading">How It Works</h2>
-        <p className="how-subtitle">
-          Four simple steps — no technical knowledge needed
+        {/* Privacy note */}
+        <p style={{ textAlign: "center", fontSize: "12px", color: "var(--muted)", marginTop: "24px" }}>
+          🔒 All processing happens in your browser. Nothing is uploaded to any server.
         </p>
-        <div className="how-grid">
-          {[
-            { num: "1", icon: "📤", title: "Upload", desc: "Drop your photo, signature, or document scan — any format works." },
-            { num: "2", icon: "🏛️", title: "Select Type", desc: "Pick your exam portal or document type to auto-load specs." },
-            { num: "3", icon: "⚡", title: "Auto Format", desc: "We resize, compress, crop, and validate to exact portal limits." },
-            { num: "4", icon: "✅", title: "Download & Upload", desc: "Validated files download instantly — upload directly to the portal." },
-          ].map((s) => (
-            <div className="how-step" key={s.num}>
-              <div className="how-step__num">{s.num}</div>
-              <div className="how-step__icon">{s.icon}</div>
-              <div className="how-step__title">{s.title}</div>
-              <div className="how-step__desc">{s.desc}</div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {/* ── FOOTER ── */}
-      <footer className="site-footer" role="contentinfo">
-        <div className="footer-logo">Form<span>Ready</span></div>
-        <p className="footer-note">
-          All processing happens in your browser. No images are ever uploaded to
-          our servers. Your files are 100% private.
-        </p>
-        <div className="footer-links">
-          <a href="/admin" aria-label="Admin preset editor">Admin Panel</a>
-          <span aria-hidden="true">·</span>
-          <a href="#main-content" aria-label="Back to top">Back to top</a>
-        </div>
-        <p className="footer-copy">
-          © 2026 FormReady · Built for CSC operators, coaching institutes &amp; exam aspirants
-        </p>
-      </footer>
+      </div>
 
       {/* ── PROCESSING OVERLAY ── */}
-      {processing && (
-        <div className="progress-overlay" role="dialog" aria-modal="true" aria-label="Processing images">
-          <div className="progress-modal">
-            <div className="progress-spinner" aria-hidden="true" />
-            <h2 className="progress-title">Formatting Images</h2>
-            <p className="progress-subtitle">{progressLabel}</p>
-            <div className="progress-bar-track" role="progressbar" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}>
-              <div className="progress-bar-fill" style={{ width: `${progress}%` }} />
+      {busy && (
+        <div className="overlay" role="dialog" aria-modal="true" aria-label="Processing">
+          <div className="overlay-box">
+            <div className="spin" aria-hidden="true" />
+            <div className="ovl-title">Formatting…</div>
+            <div className="ovl-sub">{progressLabel}</div>
+            <div className="bar-track" role="progressbar" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}>
+              <div className="bar-fill" style={{ width: `${progress}%` }} />
             </div>
-            <div className="progress-pct">{progress}%</div>
+            <div className="bar-pct">{progress}%</div>
           </div>
         </div>
       )}
 
       {/* ── TOASTS ── */}
-      <ToastContainer />
+      <div className="toast-wrap" role="status" aria-live="polite">
+        {toasts.map(t => (
+          <div key={t.id} className="toast">
+            {t.ok ? "✅" : "⚠️"} {t.msg}
+          </div>
+        ))}
+      </div>
     </>
   );
 }
