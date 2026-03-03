@@ -15,7 +15,9 @@ export interface ProcessingResult {
  * - Resize to exact dimensions
  * - Enforce white background
  * - Convert to JPEG
- * - Smart compress to target KB range
+ * - Smart binary-search compression to hit the target KB range
+ * - If image is naturally too small, adds imperceptible fine-grain
+ *   noise to pad bytes up to min_kb without visible quality change
  */
 export async function processImage(
     file: File,
@@ -47,55 +49,65 @@ export async function processImage(
     const offsetY = (spec.height - scaledH) / 2;
 
     ctx.drawImage(imageBitmap, offsetX, offsetY, scaledW, scaledH);
-    onProgress?.(60);
+    onProgress?.(55);
 
-    // Binary-search compression to hit target KB range
     const targetMinBytes = spec.min_kb * 1024;
     const targetMaxBytes = spec.max_kb * 1024;
 
-    let lo = 0.1;
+    // ── Step 1: Binary-search for quality that fits within [min, max] ──
+    let lo = 0.05;
     let hi = 1.0;
-    let bestDataUrl = "";
-    let iterations = 0;
+    let bestDataUrl = canvas.toDataURL("image/jpeg", 1.0);
+    let bestBytes = base64ByteLength(bestDataUrl);
 
-    // First try at high quality
-    bestDataUrl = canvas.toDataURL("image/jpeg", hi);
-
-    while (iterations < 15) {
+    for (let i = 0; i < 18; i++) {
         const mid = (lo + hi) / 2;
         const candidate = canvas.toDataURL("image/jpeg", mid);
         const bytes = base64ByteLength(candidate);
 
         if (bytes >= targetMinBytes && bytes <= targetMaxBytes) {
             bestDataUrl = candidate;
+            bestBytes = bytes;
             break;
         } else if (bytes > targetMaxBytes) {
             hi = mid;
-            bestDataUrl = candidate;
+            // Track the candidate closest to max (still over)
+            if (bytes < bestBytes || bestBytes > targetMaxBytes) {
+                bestDataUrl = candidate;
+                bestBytes = bytes;
+            }
         } else {
+            // bytes < targetMinBytes — image is naturally too small at this quality
             lo = mid;
+            // Track the highest-quality under-min result as fallback
+            if (bytes > bestBytes || bestBytes > targetMaxBytes) {
+                bestDataUrl = candidate;
+                bestBytes = bytes;
+            }
         }
-        iterations++;
     }
 
-    // If still not in range, pick closest quality that stays under max
-    if (!bestDataUrl) {
-        bestDataUrl = canvas.toDataURL("image/jpeg", hi);
+    onProgress?.(75);
+
+    // ── Step 2: If still below min_kb, pad with imperceptible noise ──
+    bestBytes = base64ByteLength(bestDataUrl);
+    if (bestBytes < targetMinBytes) {
+        bestDataUrl = await padToMinSize(canvas, ctx, targetMinBytes, targetMaxBytes);
+        bestBytes = base64ByteLength(bestDataUrl);
     }
 
     onProgress?.(90);
 
-    const finalBytes = base64ByteLength(bestDataUrl);
-    const finalKB = finalBytes / 1024;
-
+    const finalKB = bestBytes / 1024;
     const validationErrors: string[] = [];
+
     if (finalKB < spec.min_kb)
         validationErrors.push(
-            `File size ${finalKB.toFixed(1)} KB is below minimum ${spec.min_kb} KB`
+            `File size ${finalKB.toFixed(1)} KB is below the minimum ${spec.min_kb} KB`
         );
     if (finalKB > spec.max_kb)
         validationErrors.push(
-            `File size ${finalKB.toFixed(1)} KB exceeds maximum ${spec.max_kb} KB`
+            `File size ${finalKB.toFixed(1)} KB exceeds the maximum ${spec.max_kb} KB`
         );
 
     onProgress?.(100);
@@ -109,6 +121,81 @@ export async function processImage(
         valid: validationErrors.length === 0,
         validationErrors,
     };
+}
+
+/**
+ * Adds progressively stronger imperceptible fine-grain noise to a canvas
+ * until the JPEG output reaches targetMinBytes — binary-searches noise intensity.
+ * Noise is applied at sub-pixel level (±1 per channel) and is visually invisible.
+ */
+async function padToMinSize(
+    canvas: HTMLCanvasElement,
+    ctx: CanvasRenderingContext2D,
+    targetMinBytes: number,
+    targetMaxBytes: number
+): Promise<string> {
+    // Save original pixel data so we can non-destructively add noise layers
+    const original = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+    let lo = 0;
+    let hi = 4; // noise amplitude in [0,255] per channel — we keep it tiny (max 4)
+    let bestUrl = canvas.toDataURL("image/jpeg", 0.95);
+
+    for (let i = 0; i < 12; i++) {
+        const mid = (lo + hi) / 2;
+        if (mid < 0.05) break; // noise too small to be meaningful
+
+        // Restore clean image, then overlay noise
+        ctx.putImageData(original, 0, 0);
+        applyNoise(ctx, canvas.width, canvas.height, mid);
+
+        const candidate = canvas.toDataURL("image/jpeg", 0.95);
+        const bytes = base64ByteLength(candidate);
+
+        if (bytes >= targetMinBytes && bytes <= targetMaxBytes) {
+            bestUrl = candidate;
+            break;
+        } else if (bytes < targetMinBytes) {
+            lo = mid;
+            bestUrl = candidate; // still the best we have (closest from below)
+        } else {
+            hi = mid;
+            bestUrl = candidate;
+        }
+    }
+
+    // Restore the canvas to its original clean state
+    ctx.putImageData(original, 0, 0);
+    return bestUrl;
+}
+
+/**
+ * Applies uniform random noise of given amplitude to every pixel.
+ * Amplitude should be kept very small (≤ 4) so it's visually imperceptible.
+ */
+function applyNoise(
+    ctx: CanvasRenderingContext2D,
+    w: number,
+    h: number,
+    amplitude: number
+): void {
+    const imageData = ctx.getImageData(0, 0, w, h);
+    const data = imageData.data;
+    const amp = Math.max(0, Math.round(amplitude));
+    if (amp === 0) return;
+
+    for (let i = 0; i < data.length; i += 4) {
+        // R, G, B — skip Alpha (index i+3)
+        data[i] = clamp(data[i] + (Math.random() * 2 - 1) * amp);
+        data[i + 1] = clamp(data[i + 1] + (Math.random() * 2 - 1) * amp);
+        data[i + 2] = clamp(data[i + 2] + (Math.random() * 2 - 1) * amp);
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+}
+
+function clamp(v: number): number {
+    return Math.max(0, Math.min(255, Math.round(v)));
 }
 
 function base64ByteLength(dataUrl: string): number {
